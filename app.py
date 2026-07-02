@@ -1,6 +1,10 @@
 """
-AllRide – Cuadratura de viajes v2.1
-Templates embebidos — no requiere subir archivos de creación
+AllRide – Cuadratura de viajes v2.2
+- Normalización empresa case-insensitive en ambos lados
+- KAUFMAN → KAUFMANN
+- Usa columna EMPRESA del consolidado (no ID)
+- Shape vacío en creación de rutas
+- Templates embebidos
 """
 
 import streamlit as st
@@ -27,28 +31,66 @@ def tmpl_bytes(b64_str):
     return base64.b64decode(b64_str)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CONSTANTES
+# NORMALIZACIÓN
 # ══════════════════════════════════════════════════════════════════════════════
-EMP_NORM = {
-    "KAUFMANN":"KAUFMANN",
-    "FALABELLA - LA SERENA":"Falabella - La Serena",
-    "FALABELLA - VALPARAÍSO":"Falabella - Valparaíso",
-    "FALABELLA - VALPARAISO":"Falabella - Valparaíso",
-    "TRADIS LOGÍSTICA FALABELLA":"TRADIS Logística Falabella",
-    "TRADIS LOGISTICA FALABELLA":"TRADIS Logística Falabella",
-    "TÍO TOMATE":"Tío Tomate","TIO TOMATE":"Tío Tomate",
-    "FALABELLA - RM":"Falabella - RM",
-    "FALABELLA - RANCAGUA":"Falabella - Rancagua",
-    "FALABELLA - ANTOFAGASTA":"Falabella - Antofagasta",
-    "FALABELLA - IQUIQUE":"Falabella - Iquique",
-    "FALABELLA - VALDIVIA":"Falabella - Valdivia",
-    "FALABELLA - TALCA":"Falabella - Talca",
-    "SODIMAC - CORONEL":"Sodimac - Coronel",
-    "GRUPO ALCANSA":"Grupo Alcansa","ANDES MOTOR":"Andes Motor",
+# Mapa solo para nombres GENUINAMENTE distintos (no solo mayúsculas)
+EMP_ALIASES = {
+    "KAUFMAN": "KAUFMANN",                                        # le falta una N
+    "FALABELLA - VALPARAISO": "FALABELLA - VALPARAÍSO",
+    "FALABELLA - LA SERENA": "FALABELLA - LA SERENA",            # mantener
+    "FALABELLA - SERENA": "FALABELLA - LA SERENA",               # alias sin "LA"
+    "TRADIS LOGISTICA FALABELLA": "TRADIS LOGÍSTICA FALABELLA",
+    "TIO TOMATE": "TÍO TOMATE",
 }
+
+# Mapa de nombre normalizado → nombre canónico para mostrar
+CANON = {
+    "KAUFMANN": "KAUFMANN",
+    "FALABELLA - RM": "Falabella - RM",
+    "FALABELLA - RANCAGUA": "Falabella - Rancagua",
+    "FALABELLA - ANTOFAGASTA": "Falabella - Antofagasta",
+    "FALABELLA - IQUIQUE": "Falabella - Iquique",
+    "FALABELLA - VALDIVIA": "Falabella - Valdivia",
+    "FALABELLA - VALPARAÍSO": "Falabella - Valparaíso",
+    "FALABELLA - LA SERENA": "Falabella - La Serena",
+    "FALABELLA - TALCA": "Falabella - Talca",
+    "TRADIS LOGÍSTICA FALABELLA": "TRADIS Logística Falabella",
+    "TÍO TOMATE": "Tío Tomate",
+    "SODIMAC - CORONEL": "Sodimac - Coronel",
+    "GRUPO ALCANSA": "Grupo Alcansa",
+    "ANDES MOTOR": "Andes Motor",
+}
+
+def norm_base(s):
+    """Normaliza a mayúsculas sin tildes para comparación."""
+    s = str(s).strip().upper()
+    for a, b in [("Á","A"),("É","E"),("Í","I"),("Ó","O"),("Ú","U"),("Ñ","N")]:
+        s = s.replace(a, b)
+    return s
+
+def norm_empresa_key(s):
+    """
+    Devuelve clave normalizada para comparación:
+    1. Mayúsculas + sin tildes
+    2. Aplica aliases para nombres genuinamente distintos
+    """
+    n = norm_base(s)
+    # Reintroducir tildes canónicas para aliases
+    n_con_tilde = str(s).strip().upper()
+    # Aplicar alias (sin tildes → con tildes canónicas)
+    resultado = EMP_ALIASES.get(n, n)
+    return resultado
+
+def canon_empresa(s):
+    """Devuelve nombre canónico para mostrar."""
+    key = norm_empresa_key(s)
+    return CANON.get(key, str(s).strip())
+
 TIPO_AR = {
-    "SALIDA CALENDARIZADA":"REGULAR","SALIDA REALIZADA":"REGULAR",
-    "SERVICIO REGULAR":"REGULAR","SERVICIO ESPECIAL":"SPOT",
+    "SALIDA CALENDARIZADA": "REGULAR",
+    "SALIDA REALIZADA": "REGULAR",
+    "SERVICIO REGULAR": "REGULAR",
+    "SERVICIO ESPECIAL": "SPOT",
 }
 PARADA_FALLBACK = "Parada TRP"
 PARADA_INGRESO  = "Parada"
@@ -56,22 +98,12 @@ PARADA_INGRESO  = "Parada"
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
-def norm(s):
-    s = str(s).strip().upper()
-    for a,b in [("Á","A"),("É","E"),("Í","I"),("Ó","O"),("Ú","U"),("Ñ","N")]:
-        s = s.replace(a, b)
-    return s
-
-def norm_empresa(s):
-    n = norm(str(s))
-    return EMP_NORM.get(n, str(s).strip())
-
 def norm_ruta(s):
     s = re.sub(r"^RDD\s*-\s*", "", str(s).strip(), flags=re.IGNORECASE)
-    return norm(s)
+    return norm_base(s)
 
 def is_spot(ruta):
-    return "SPOT" in norm(str(ruta))
+    return "SPOT" in norm_base(str(ruta))
 
 def parse_hora(val):
     if val is None or (isinstance(val, float) and pd.isna(val)): return "00:00"
@@ -119,15 +151,13 @@ def fmt_fecha_excel(fecha_str):
     return fecha_str
 
 def detectar_col(cols, candidates):
-    cn = {norm(c): c for c in cols}
+    cn = {norm_base(c): c for c in cols}
     for c in candidates:
-        if norm(c) in cn: return cn[norm(c)]
+        if norm_base(c) in cn: return cn[norm_base(c)]
     return None
 
-def safe_split_newline(val):
-    """Split por newline de forma segura — devuelve primera parte o string vacío."""
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return ""
+def safe_str(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)): return ""
     return str(val).split("\n")[0].strip()
 
 def extraer_ultima_parada(recorrido_str):
@@ -145,13 +175,12 @@ def extraer_ultima_parada(recorrido_str):
         if len(parts) > 1: return parts[-1]
     return None
 
-def stops_empresa(stops_df, empresa):
+def stops_empresa(stops_df, empresa_key):
     result = set()
-    en = norm(empresa)
     for _, row in stops_df.iterrows():
         comunidades = str(row.get("Comunidades", ""))
-        partes = [norm(p.strip()) for p in re.split(r"[,;]", comunidades)]
-        if en in partes:
+        partes = [norm_empresa_key(p.strip()) for p in re.split(r"[,;]", comunidades)]
+        if empresa_key in partes:
             result.add(str(row["Nombre parada"]).strip())
     return result
 
@@ -169,7 +198,7 @@ def leer_consolidado(f):
     xl = pd.ExcelFile(f)
     hoja = None
     for h in xl.sheet_names:
-        if norm(h) in ["RESUMEN","PROGRAMACION RM","PROGRAMACION","PROGRAMA","PROGRAMACIÓN RM"]:
+        if norm_base(h) in ["RESUMEN","PROGRAMACION RM","PROGRAMACION","PROGRAMA","PROGRAMACION RM"]:
             hoja = h; break
     if not hoja: hoja = xl.sheet_names[0]
     return pd.read_excel(f, sheet_name=hoja), hoja
@@ -180,7 +209,7 @@ def procesar_consolidado(df):
     col_postura   = detectar_col(cols, ["HORA DE POSTURA"])
     col_hora      = detectar_col(cols, ["HORA DE LLEGADA A BODEGA","HORA DE LLEGADA\n HORA DE SALIDA","HORA DE SALIDA","HORA DE LLEGADA","HORA"])
     col_fecha     = detectar_col(cols, ["FECHA"])
-    col_empresa   = detectar_col(cols, ["EMPRESA"])
+    col_empresa   = detectar_col(cols, ["EMPRESA"])   # ← SIEMPRE usar EMPRESA, no ID
     col_tipo      = detectar_col(cols, ["TIPO DE PEDIDO","TIPO"])
     col_bodega    = detectar_col(cols, ["BODEGA"])
     col_recorrido = detectar_col(cols, ["RECORRIDO"])
@@ -189,18 +218,21 @@ def procesar_consolidado(df):
     if not col_ruta or not col_fecha:
         st.error("❌ No se encontró columna de ruta o fecha en el consolidado.")
         st.stop()
+    if not col_empresa:
+        st.error("❌ No se encontró columna EMPRESA en el consolidado.")
+        st.stop()
 
     out = pd.DataFrame()
-    out["ruta_orig"]    = df[col_ruta].astype(str).str.strip()
-    out["ruta_norm"]    = out["ruta_orig"].apply(norm_ruta)
-    out["empresa_orig"] = df[col_empresa].astype(str).str.strip() if col_empresa else "SIN EMPRESA"
-    out["empresa_norm"] = out["empresa_orig"].apply(norm_empresa)
-    out["fecha"]        = pd.to_datetime(df[col_fecha], dayfirst=True, errors="coerce").dt.strftime("%d/%m/%Y")
-    out["tipo_norm"]    = df[col_tipo].apply(lambda x: norm(str(x))) if col_tipo else "REGULAR"
-    # ← FIX: usar safe_split_newline para evitar error con NaN
-    out["bodega"]       = df[col_bodega].apply(safe_split_newline) if col_bodega else ""
-    out["recorrido"]    = df[col_recorrido].astype(str) if col_recorrido else ""
-    out["tipo_mov"]     = df[col_tipo_mov].astype(str).str.strip().str.upper() if col_tipo_mov else ""
+    out["ruta_orig"]     = df[col_ruta].astype(str).str.strip()
+    out["ruta_norm"]     = out["ruta_orig"].apply(norm_ruta)
+    out["empresa_orig"]  = df[col_empresa].astype(str).str.strip()
+    out["empresa_key"]   = out["empresa_orig"].apply(norm_empresa_key)   # para comparar
+    out["empresa_canon"] = out["empresa_orig"].apply(canon_empresa)       # para mostrar
+    out["fecha"]         = pd.to_datetime(df[col_fecha], dayfirst=True, errors="coerce").dt.strftime("%d/%m/%Y")
+    out["tipo_norm"]     = df[col_tipo].apply(lambda x: norm_base(str(x))) if col_tipo else "REGULAR"
+    out["bodega"]        = df[col_bodega].apply(safe_str) if col_bodega else ""
+    out["recorrido"]     = df[col_recorrido].astype(str) if col_recorrido else ""
+    out["tipo_mov"]      = df[col_tipo_mov].astype(str).str.strip().str.upper() if col_tipo_mov else ""
 
     if col_postura:
         out["hora_postura"] = df[col_postura].apply(parse_hora)
@@ -225,30 +257,32 @@ def procesar_allride(df):
 
     fecha_raw = df[col_fecha_raw] if col_fecha_raw else pd.Series([""] * len(df))
     out = pd.DataFrame()
-    out["id"]           = df[col_id].astype(str).str.strip() if col_id else ""
-    out["ruta_orig"]    = df[col_ruta].astype(str).str.strip() if col_ruta else ""
-    out["ruta_norm"]    = out["ruta_orig"].apply(norm_ruta)
-    out["empresa_orig"] = df[col_empresa].astype(str).str.strip() if col_empresa else ""
-    out["empresa_norm"] = out["empresa_orig"].apply(norm_empresa)
-    out["tipo_orig"]    = df[col_tipo].astype(str).str.strip() if col_tipo else ""
-    out["tipo_norm"]    = out["tipo_orig"].apply(lambda x: TIPO_AR.get(norm(x), norm(x)))
-    out["estado"]       = df[col_estado].astype(str).str.strip() if col_estado else ""
-    out["fecha"]        = fecha_raw.apply(parse_fecha_ar)
-    out["hora"]         = fecha_raw.apply(parse_hora_ar)
-    out["es_spot"]      = out["ruta_norm"].apply(is_spot)
+    out["id"]            = df[col_id].astype(str).str.strip() if col_id else ""
+    out["ruta_orig"]     = df[col_ruta].astype(str).str.strip() if col_ruta else ""
+    out["ruta_norm"]     = out["ruta_orig"].apply(norm_ruta)
+    out["empresa_orig"]  = df[col_empresa].astype(str).str.strip() if col_empresa else ""
+    out["empresa_key"]   = out["empresa_orig"].apply(norm_empresa_key)   # para comparar
+    out["empresa_canon"] = out["empresa_orig"].apply(canon_empresa)       # para mostrar
+    out["tipo_orig"]     = df[col_tipo].astype(str).str.strip() if col_tipo else ""
+    out["tipo_norm"]     = out["tipo_orig"].apply(lambda x: TIPO_AR.get(norm_base(x), norm_base(x)))
+    out["estado"]        = df[col_estado].astype(str).str.strip() if col_estado else ""
+    out["fecha"]         = fecha_raw.apply(parse_fecha_ar)
+    out["hora"]          = fecha_raw.apply(parse_hora_ar)
+    out["es_spot"]       = out["ruta_norm"].apply(is_spot)
     return out.reset_index(drop=True)
 
 def cuadrar(cli, ar):
+    # Clave de agrupación usa empresa_key normalizada
     ar_grupos = {}
     for idx, row in ar.iterrows():
-        k = (row["fecha"], row["ruta_norm"], row["empresa_norm"])
+        k = (row["fecha"], row["ruta_norm"], row["empresa_key"])
         ar_grupos.setdefault(k, []).append((idx, row))
 
     ar_usados = set()
     res = {"ok":[], "editar":[], "cancelar":[], "crear":[]}
 
     for _, crow in cli.iterrows():
-        k = (crow["fecha"], crow["ruta_norm"], crow["empresa_norm"])
+        k = (crow["fecha"], crow["ruta_norm"], crow["empresa_key"])
         hora_obj   = crow["hora_allride"]
         candidatos = ar_grupos.get(k, [])
 
@@ -286,7 +320,7 @@ def cuadrar(cli, ar):
 def analizar_paradas(cli, stops_df, routes_df):
     stops_norm = {}
     for _, r in stops_df.iterrows():
-        n = norm(str(r["Nombre parada"]))
+        n = norm_base(str(r["Nombre parada"]))
         stops_norm[n] = {"nombre": str(r["Nombre parada"]), "comunidades": str(r.get("Comunidades",""))}
 
     routes_norm = {}
@@ -299,35 +333,36 @@ def analizar_paradas(cli, stops_df, routes_df):
 
     for _, crow in cli.iterrows():
         if crow["es_spot"]: continue
-        empresa = crow["empresa_norm"]
-        ruta_n  = crow["ruta_norm"]
+        empresa_key = crow["empresa_key"]
+        empresa_orig = crow["empresa_canon"]
+        ruta_n = crow["ruta_norm"]
         ruta_ar = routes_norm.get(ruta_n)
 
         paradas = []
         if ruta_ar is not None:
-            po  = str(ruta_ar.get("Nombre Parada Origen","")).strip()
-            pd_ = str(ruta_ar.get("Nombre Parada Destino","")).strip()
-            if po  and po  not in ["nan",""]: paradas.append(po)
-            if pd_ and pd_ not in ["nan",""]: paradas.append(pd_)
+            po  = safe_str(ruta_ar.get("Nombre Parada Origen",""))
+            pd_ = safe_str(ruta_ar.get("Nombre Parada Destino",""))
+            if po  not in ["nan",""]: paradas.append(po)
+            if pd_ not in ["nan",""]: paradas.append(pd_)
         else:
             if crow.get("bodega"): paradas.append(crow["bodega"])
 
         for parada in paradas:
-            pk  = norm(parada)
-            key = f"{pk}|{norm(empresa)}"
+            pk  = norm_base(parada)
+            key = f"{pk}|{empresa_key}"
             if key in vistas: continue
             vistas.add(key)
 
             if pk not in stops_norm:
                 if not any(p["Nombre parada"] == parada for p in paradas_faltantes):
-                    paradas_faltantes.append({"Nombre parada": parada, "Empresa": empresa, "Ruta": crow["ruta_orig"]})
+                    paradas_faltantes.append({"Nombre parada": parada, "Empresa": empresa_orig, "Ruta": crow["ruta_orig"]})
             else:
                 info  = stops_norm[pk]
-                comps = [norm(c.strip()) for c in re.split(r"[,;]", info["comunidades"])]
-                if norm(empresa) not in comps:
+                comps = [norm_empresa_key(c.strip()) for c in re.split(r"[,;]", info["comunidades"])]
+                if empresa_key not in comps:
                     adv_acceso.append({
                         "Parada": info["nombre"],
-                        "Empresa que la necesita": empresa,
+                        "Empresa que la necesita": empresa_orig,
                         "Comunidades actuales": info["comunidades"],
                         "Ruta": crow["ruta_orig"]
                     })
@@ -343,14 +378,14 @@ def analizar_rutas(cli, routes_df):
         if rn not in routes_norm and rn not in nuevas:
             nuevas[rn] = {
                 "Nombre ruta": crow["ruta_orig"],
-                "Empresa": crow["empresa_norm"],
+                "Empresa": crow["empresa_canon"],
                 "Tipo mov": crow.get("tipo_mov",""),
                 "Bodega": crow.get("bodega","")
             }
     return list(nuevas.values())
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GENERADORES — usan templates embebidos
+# GENERADORES
 # ══════════════════════════════════════════════════════════════════════════════
 def gen_stops_creation(paradas):
     wb = openpyxl.load_workbook(BytesIO(tmpl_bytes(TMPL_STOPS)))
@@ -358,8 +393,8 @@ def gen_stops_creation(paradas):
     font = Font(name="Calibri", size=11)
     for i, p in enumerate(paradas, 2):
         ws.cell(i,1, p["Nombre parada"]).font = font
-        ws.cell(i,2, "").font = font   # Lat — completar manualmente
-        ws.cell(i,3, "").font = font   # Lon — completar manualmente
+        ws.cell(i,2, "").font = font
+        ws.cell(i,3, "").font = font
         ws.cell(i,4, p["Empresa"]).font = font
         ws.cell(i,5, "Sí").font = font
         ws.cell(i,6, p["Nombre parada"]).font = font
@@ -380,32 +415,31 @@ def gen_routes_creation(rutas):
         else:
             origen  = PARADA_INGRESO
             destino = bodega or "Parada"
-        ws.cell(i, 1, r["Nombre ruta"]).font = font
-        ws.cell(i, 2, r["Nombre ruta"]).font = font
-        ws.cell(i, 3, "-").font = font
-        ws.cell(i, 4, "Ida").font = font
-        ws.cell(i, 5, origen).font = font
-        ws.cell(i, 6, destino).font = font
-        ws.cell(i, 7, "-").font = font
-        ws.cell(i,19, "Si").font = font
-        ws.cell(i,22, r["Empresa"]).font = font
+        ws.cell(i, 1, r["Nombre ruta"]).font = font   # Nombre ruta
+        ws.cell(i, 2, r["Nombre ruta"]).font = font   # Descripción
+        ws.cell(i, 3, None)                            # Shape — vacío ← FIX
+        ws.cell(i, 4, "Ida").font = font               # Movimiento
+        ws.cell(i, 5, origen).font = font              # Parada Origen
+        ws.cell(i, 6, destino).font = font             # Parada Destino
+        ws.cell(i, 7, "-").font = font                 # Config opcionales
+        ws.cell(i,19, "Si").font = font                # Permitir Snapshots
+        ws.cell(i,22, r["Empresa"]).font = font        # Comunidades
     buf = BytesIO(); wb.save(buf); return buf.getvalue()
 
 def gen_edicion_horarios(editar_filas, tmpl_file=None):
     font = Font(name="Calibri", size=12)
     if not tmpl_file:
         rows = [{"ID de servicio":e["ar_row"]["id"],"Hora del servicio":e["hora_nueva"],
-                 "Ruta":e["ar_row"]["ruta_orig"],"Empresa":e["ar_row"]["empresa_orig"],
+                 "Ruta":e["ar_row"]["ruta_orig"],"Empresa":e["ar_row"]["empresa_canon"],
                  "Fecha":e["ar_row"]["fecha"],"Hora actual":e["hora_actual"]} for e in editar_filas]
         buf = BytesIO(); pd.DataFrame(rows).to_excel(buf, index=False); return buf.getvalue()
-
     wb = openpyxl.load_workbook(BytesIO(tmpl_file.read()))
     ws = wb.active
     header = [ws.cell(1,c).value for c in range(1, ws.max_column+2)]
     def fc(names):
         for n in names:
             for i,h in enumerate(header):
-                if h and norm(str(h)) == norm(n): return i+1
+                if h and norm_base(str(h)) == norm_base(n): return i+1
         return None
     col_id   = fc(["ID de servicio","ID"])
     col_hora = fc(["Hora del servicio","Hora de inicio","Hora"])
@@ -422,8 +456,7 @@ def gen_one_time_services(crear_filas):
     por_emp = {}
     for row in crear_filas:
         if row["es_spot"]: continue
-        por_emp.setdefault(row["empresa_norm"], []).append(row)
-
+        por_emp.setdefault(row["empresa_canon"], []).append(row)
     archivos = {}
     for emp, rows in por_emp.items():
         wb = openpyxl.load_workbook(BytesIO(tmpl_bytes(TMPL_OTS)))
@@ -447,28 +480,24 @@ def gen_odd_spots(crear_filas, stops_df):
     por_emp = {}
     for row in crear_filas:
         if not row["es_spot"]: continue
-        por_emp.setdefault(row["empresa_norm"], []).append(row)
-
+        por_emp.setdefault(row["empresa_canon"], []).append(row)
     stops_cache = {}
     archivos    = {}
-
     for emp, rows in por_emp.items():
-        if emp not in stops_cache:
-            stops_cache[emp] = stops_empresa(stops_df, emp)
-        emp_stops = stops_cache[emp]
-
+        emp_key = norm_empresa_key(emp)
+        if emp_key not in stops_cache:
+            stops_cache[emp_key] = stops_empresa(stops_df, emp_key)
+        emp_stops = stops_cache[emp_key]
         wb = openpyxl.load_workbook(BytesIO(tmpl_bytes(TMPL_ODD)))
         ws = wb.active
         for r in ws.iter_rows(min_row=2, max_row=ws.max_row):
             for c in r: c.value = None
         font = Font(name="Calibri", size=11)
-
         for i, row in enumerate(rows, 2):
             tipo_mov  = str(row.get("tipo_mov","")).upper()
             bodega    = str(row.get("bodega","")).strip()
             recorrido = str(row.get("recorrido","")).strip()
             es_salida = "SALIDA" in tipo_mov
-
             if es_salida:
                 npo           = bodega if bodega and bodega in emp_stops else PARADA_FALLBACK
                 ultima        = extraer_ultima_parada(recorrido)
@@ -481,7 +510,6 @@ def gen_odd_spots(crear_filas, stops_df):
                 npo           = None
                 npd           = bodega if bodega and bodega in emp_stops else PARADA_INGRESO
                 od            = "Destino"
-
             ws.cell(i, 1, i-1).font = font
             ws.cell(i, 2, row["ruta_orig"]).font = font
             ws.cell(i, 3, "Servicios Dinámicos").font = font
@@ -496,7 +524,6 @@ def gen_odd_spots(crear_filas, stops_df):
             ws.cell(i,12, "").font = font
             ws.cell(i,13, "").font = font
             ws.cell(i,14, emp).font = font
-
         buf = BytesIO(); wb.save(buf)
         nombre = re.sub(r"[^\w\-]", "_", emp)[:40]
         archivos[f"ODD_SPOTS_{nombre}.xlsx"] = buf.getvalue()
@@ -544,18 +571,17 @@ with st.sidebar:
     f_edit_spot_tmpl = st.file_uploader("Template edición horarios SPOT", type=["xlsx","xls"])
 
     st.divider()
-    st.caption("Templates de creación (paradas, rutas, OTS, ODD) vienen incorporados ✅")
+    st.caption("✅ Templates de creación vienen incorporados")
 
 if not all([f_consolidado, f_allride, f_cancel_tmpl]):
     st.info("⬅️ Sube los 3 archivos obligatorios para comenzar.")
     st.stop()
 
-# ── PROCESAR ─────────────────────────────────────────────────────────────────
 with st.spinner("Procesando..."):
     cli_raw, hoja_cli = leer_consolidado(f_consolidado)
     ar_raw  = pd.read_excel(f_allride)
     stops_df  = pd.read_excel(f_stops_list)  if f_stops_list  else pd.DataFrame(columns=["Comunidades","Nombre parada","Lat","Lon"])
-    routes_df = pd.read_excel(f_routes_list) if f_routes_list else pd.DataFrame(columns=["Nombre ruta","Nombre Parada Origen","Nombre Parada Destino","Comunidades (Nombre exacto, separados por comas)"])
+    routes_df = pd.read_excel(f_routes_list) if f_routes_list else pd.DataFrame(columns=["Nombre ruta","Nombre Parada Origen","Nombre Parada Destino"])
 
     cli = procesar_consolidado(cli_raw)
     ar  = procesar_allride(ar_raw)
@@ -568,7 +594,6 @@ with st.spinner("Procesando..."):
 
 st.caption(f"📋 Hoja **{hoja_cli}** · {len(cli)} viajes cliente · {len(ar)} viajes AllRide")
 
-# ── MÉTRICAS ─────────────────────────────────────────────────────────────────
 st.divider()
 c = st.columns(7)
 c[0].metric("✅ OK",           len(res["ok"]))
@@ -579,19 +604,12 @@ c[4].metric("🔶 Crear SPOT",   len(crear_spot))
 c[5].metric("❌ Cancelar",     len(res["cancelar"]))
 c[6].metric("📋 Total cliente",len(cli))
 
-# ── TABS ─────────────────────────────────────────────────────────────────────
 tabs = st.tabs([
-    "1️⃣ Paradas",
-    "2️⃣ Rutas nuevas",
-    "3️⃣ Editar regulares",
-    "4️⃣ Editar SPOT",
-    "5️⃣ Crear regulares",
-    "6️⃣ Crear SPOT",
-    "7️⃣ Cancelación",
-    "📦 Todo en ZIP",
+    "1️⃣ Paradas","2️⃣ Rutas nuevas","3️⃣ Editar regulares",
+    "4️⃣ Editar SPOT","5️⃣ Crear regulares","6️⃣ Crear SPOT",
+    "7️⃣ Cancelación","📦 Todo en ZIP",
 ])
 
-# ─── TAB 1 ───────────────────────────────────────────────────────────────────
 with tabs[0]:
     st.subheader("1️⃣ Verificación de paradas")
     if not f_stops_list:
@@ -599,38 +617,33 @@ with tabs[0]:
     else:
         adv_acceso, paradas_faltantes = analizar_paradas(cli, stops_df, routes_df)
         if adv_acceso:
-            st.warning(f"⚠️ **{len(adv_acceso)} paradas sin acceso para el cliente** — revisar manualmente en AllRide:")
+            st.warning(f"⚠️ **{len(adv_acceso)} paradas sin acceso** — revisar manualmente en AllRide:")
             st.dataframe(pd.DataFrame(adv_acceso), use_container_width=True)
         else:
-            st.success("✅ Sin problemas de acceso a paradas existentes.")
-
+            st.success("✅ Sin problemas de acceso.")
         if paradas_faltantes:
             st.error(f"🔴 **{len(paradas_faltantes)} paradas no existen en AllRide:**")
             st.dataframe(pd.DataFrame(paradas_faltantes), use_container_width=True)
-            data = gen_stops_creation(paradas_faltantes)
-            st.download_button("⬇️ Descargar paradas a crear", data,
+            st.download_button("⬇️ Descargar paradas a crear", gen_stops_creation(paradas_faltantes),
                 "paradas_a_crear.xlsx", use_container_width=True)
-            st.caption("⚠️ Lat/Lon deben completarse manualmente antes de subir a AllRide.")
+            st.caption("⚠️ Lat/Lon deben completarse manualmente.")
         else:
-            st.success("✅ Todas las paradas necesarias existen en AllRide.")
+            st.success("✅ Todas las paradas existen.")
 
-# ─── TAB 2 ───────────────────────────────────────────────────────────────────
 with tabs[1]:
     st.subheader("2️⃣ Rutas regulares a crear")
     if not f_routes_list:
-        st.warning("⚠️ Sube el archivo de rutas existentes para este análisis.")
+        st.warning("⚠️ Sube el archivo de rutas existentes.")
     else:
         rutas_nuevas = analizar_rutas(cli, routes_df)
         if rutas_nuevas:
             st.error(f"🔴 **{len(rutas_nuevas)} rutas no existen en AllRide:**")
             st.dataframe(pd.DataFrame(rutas_nuevas), use_container_width=True)
-            data = gen_routes_creation(rutas_nuevas)
-            st.download_button("⬇️ Descargar rutas a crear", data,
+            st.download_button("⬇️ Descargar rutas a crear", gen_routes_creation(rutas_nuevas),
                 "rutas_a_crear.xlsx", use_container_width=True)
         else:
-            st.success("✅ Todas las rutas regulares ya existen en AllRide.")
+            st.success("✅ Todas las rutas ya existen.")
 
-# ─── TAB 3 ───────────────────────────────────────────────────────────────────
 with tabs[2]:
     st.subheader("3️⃣ Edición de horarios — regulares")
     if not editar_reg:
@@ -638,15 +651,14 @@ with tabs[2]:
     else:
         st.dataframe(pd.DataFrame([{
             "Fecha":e["ar_row"]["fecha"],"Ruta":e["ar_row"]["ruta_orig"],
-            "Empresa":e["ar_row"]["empresa_orig"],"ID":e["ar_row"]["id"],
+            "Empresa":e["ar_row"]["empresa_canon"],"ID":e["ar_row"]["id"],
             "Hora actual":e["hora_actual"],"→ Hora nueva":e["hora_nueva"],
-            "Postura cliente":e["cli_row"].get("hora_postura",""),
+            "Postura":e["cli_row"].get("hora_postura",""),
         } for e in editar_reg]), use_container_width=True)
-        st.download_button(f"⬇️ Descargar edición horarios regulares ({len(editar_reg)})",
+        st.download_button(f"⬇️ Edición horarios regulares ({len(editar_reg)})",
             gen_edicion_horarios(editar_reg, f_edit_reg_tmpl),
             "Edicion_horarios_regulares.xlsx", use_container_width=True)
 
-# ─── TAB 4 ───────────────────────────────────────────────────────────────────
 with tabs[3]:
     st.subheader("4️⃣ Edición de horarios — SPOT")
     if not editar_spot:
@@ -654,22 +666,21 @@ with tabs[3]:
     else:
         st.dataframe(pd.DataFrame([{
             "Fecha":e["ar_row"]["fecha"],"Ruta":e["ar_row"]["ruta_orig"],
-            "Empresa":e["ar_row"]["empresa_orig"],"ID":e["ar_row"]["id"],
+            "Empresa":e["ar_row"]["empresa_canon"],"ID":e["ar_row"]["id"],
             "Hora actual":e["hora_actual"],"→ Hora nueva":e["hora_nueva"],
-            "Postura cliente":e["cli_row"].get("hora_postura",""),
+            "Postura":e["cli_row"].get("hora_postura",""),
         } for e in editar_spot]), use_container_width=True)
-        st.download_button(f"⬇️ Descargar edición horarios SPOT ({len(editar_spot)})",
+        st.download_button(f"⬇️ Edición horarios SPOT ({len(editar_spot)})",
             gen_edicion_horarios(editar_spot, f_edit_spot_tmpl),
             "Edicion_horarios_SPOT.xlsx", use_container_width=True)
 
-# ─── TAB 5 ───────────────────────────────────────────────────────────────────
 with tabs[4]:
     st.subheader("5️⃣ Crear viajes regulares — One Time Services")
     if not crear_reg:
         st.success("✅ No hay viajes regulares que crear.")
     else:
         por_emp = {}
-        for r in crear_reg: por_emp.setdefault(r["empresa_norm"],[]).append(r)
+        for r in crear_reg: por_emp.setdefault(r["empresa_canon"],[]).append(r)
         st.info(f"**{len(crear_reg)} viajes** en **{len(por_emp)} empresas**")
         for emp, rows in sorted(por_emp.items()):
             with st.expander(f"**{emp}** — {len(rows)} viajes"):
@@ -686,14 +697,13 @@ with tabs[4]:
                 gen_zip(arch), "one_time_services.zip",
                 mime="application/zip", use_container_width=True)
 
-# ─── TAB 6 ───────────────────────────────────────────────────────────────────
 with tabs[5]:
     st.subheader("6️⃣ Crear viajes SPOT — ODD")
     if not crear_spot:
         st.success("✅ No hay viajes SPOT que crear.")
     else:
         por_emp = {}
-        for r in crear_spot: por_emp.setdefault(r["empresa_norm"],[]).append(r)
+        for r in crear_spot: por_emp.setdefault(r["empresa_canon"],[]).append(r)
         st.info(f"**{len(crear_spot)} viajes SPOT** en **{len(por_emp)} empresas**")
         for emp, rows in sorted(por_emp.items()):
             with st.expander(f"**{emp}** — {len(rows)} viajes"):
@@ -701,23 +711,17 @@ with tabs[5]:
                     "Fecha":r["fecha"],"Hora":r["hora_allride"],
                     "Ruta":r["ruta_orig"],"Tipo":r.get("tipo_mov","")
                 } for r in rows]))
-        if f_stops_list:
-            arch = gen_odd_spots(crear_spot, stops_df)
-            if len(arch) == 1:
-                name, data = list(arch.items())[0]
-                st.download_button(f"⬇️ {name}", data, name, use_container_width=True)
-            else:
-                st.download_button(f"⬇️ Descargar todos ({len(arch)} archivos .zip)",
-                    gen_zip(arch), "ODD_SPOTS.zip",
-                    mime="application/zip", use_container_width=True)
+        arch = gen_odd_spots(crear_spot, stops_df)
+        if len(arch) == 1:
+            name, data = list(arch.items())[0]
+            st.download_button(f"⬇️ {name}", data, name, use_container_width=True)
         else:
-            st.warning("⚠️ Sube el archivo de paradas existentes para detectar paradas de origen/destino en los SPOT.")
-            arch = gen_odd_spots(crear_spot, pd.DataFrame(columns=["Comunidades","Nombre parada"]))
-            if arch:
-                st.download_button(f"⬇️ Descargar ODD (sin verificación de paradas, {len(arch)} archivos)",
-                    gen_zip(arch), "ODD_SPOTS.zip", mime="application/zip", use_container_width=True)
+            st.download_button(f"⬇️ Descargar todos ({len(arch)} archivos .zip)",
+                gen_zip(arch), "ODD_SPOTS.zip",
+                mime="application/zip", use_container_width=True)
+        if not f_stops_list:
+            st.caption("⚠️ Sin archivo de paradas, se usarán paradas genéricas (Parada TRP / Parada).")
 
-# ─── TAB 7 ───────────────────────────────────────────────────────────────────
 with tabs[6]:
     st.subheader("7️⃣ Cancelación masiva")
     if not res["cancelar"]:
@@ -725,51 +729,39 @@ with tabs[6]:
     else:
         st.dataframe(pd.DataFrame([{
             "Fecha":r["fecha"],"Hora":r["hora"],"Ruta":r["ruta_orig"],
-            "Empresa":r["empresa_orig"],"Tipo":r["tipo_orig"],
-            "ID":r["id"],"Estado":r["estado"]
+            "Empresa":r["empresa_canon"],"ID":r["id"],"Estado":r["estado"]
         } for r in res["cancelar"]]), use_container_width=True)
-        cancel_bytes = f_cancel_tmpl.read()
         st.download_button(
             f"⬇️ Cancelación masiva ({len(res['cancelar'])} viajes)",
-            gen_cancelacion(res["cancelar"], cancel_bytes),
+            gen_cancelacion(res["cancelar"], f_cancel_tmpl.read()),
             "Cancelacion_masiva.xlsx", use_container_width=True)
 
-# ─── TAB 8 ───────────────────────────────────────────────────────────────────
 with tabs[7]:
     st.subheader("📦 Paquete completo")
     st.info("Genera un ZIP con todos los archivos organizados por paso.")
-
     if st.button("🚀 Generar paquete completo", type="primary", use_container_width=True):
         todos = {}
-
         if f_stops_list:
             adv, falt = analizar_paradas(cli, stops_df, routes_df)
             if falt:
                 todos["01_paradas/paradas_a_crear.xlsx"] = gen_stops_creation(falt)
-
         if f_routes_list:
             rutas_n = analizar_rutas(cli, routes_df)
             if rutas_n:
                 todos["02_rutas/rutas_a_crear.xlsx"] = gen_routes_creation(rutas_n)
-
         if editar_reg:
             todos["03_editar_reg/Edicion_horarios_regulares.xlsx"] = gen_edicion_horarios(editar_reg, f_edit_reg_tmpl)
-
         if editar_spot:
             todos["04_editar_spot/Edicion_horarios_SPOT.xlsx"] = gen_edicion_horarios(editar_spot, f_edit_spot_tmpl)
-
         for k,v in gen_one_time_services(crear_reg).items():
             todos[f"05_crear_reg/{k}"] = v
-
-        for k,v in gen_odd_spots(crear_spot, stops_df if f_stops_list else pd.DataFrame(columns=["Comunidades","Nombre parada"])).items():
+        for k,v in gen_odd_spots(crear_spot, stops_df).items():
             todos[f"06_crear_spot/{k}"] = v
-
         todos["07_cancelar/Cancelacion_masiva.xlsx"] = gen_cancelacion(res["cancelar"], f_cancel_tmpl.read())
-
         zip_data = gen_zip(todos)
         st.download_button("⬇️ Descargar paquete completo", zip_data,
             "allride_cuadratura_completo.zip", mime="application/zip", use_container_width=True)
         st.success(f"✅ {len(todos)} archivos en {len(set(k.split('/')[0] for k in todos))} carpetas.")
 
 st.divider()
-st.caption("AllRide Cuadratura v2.1 · Templates embebidos · Flujo: Paradas → Rutas → Editar → Crear → Cancelar")
+st.caption("AllRide Cuadratura v2.2 · Normalización empresa case-insensitive · Templates embebidos")
