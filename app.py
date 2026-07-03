@@ -1,5 +1,5 @@
 """
-AllRide – Cuadratura de viajes v2.8
+AllRide – Cuadratura de viajes v3.0
 Cambios:
 - Selección de filas a editar con checkbox + Seleccionar todo
 - Archivo consolidado de no-editados
@@ -28,6 +28,15 @@ Cambios:
   Ahora usa 'mm-dd-yy' (el string que openpyxl mapea al numFmtId=14 real, sin custom)
 - Crear regulares y Crear SPOT: cuando hay varias comunidades, ahora se descarga un
   archivo por comunidad (botones individuales) en vez de un único .zip
+- Homologación TALLER -> TALLER TRP (mismo problema que TRP -> APOYO TRP: la empresa del
+  consolidado no coincidía con la comunidad real en AllRide, generaba "crear" y
+  "cancelar" indebidos para servicios que ya existían)
+- Nueva regla: ruta "Apoyo en Ruta" + empresa "Apoyo en Ruta" en el consolidado (diario
+  y Programación Regiones) fuerza la comunidad AllRide a "APOYO TRP"
+- ODD/SPOT: se evita que Parada Origen/Destino y Parada Usuario queden con el mismo
+  valor (AllRide rechaza esas filas); si el respaldo genérico también choca, usa el
+  otro respaldo disponible. gen_odd_spots ahora retorna (archivos, colisiones) y la
+  pestaña 6 avisa cuántas filas se ajustaron automáticamente
 """
 
 import streamlit as st
@@ -65,6 +74,7 @@ EMP_ALIASES = {
     "TRADIS LOGISTICA FALABELLA": "TRADIS LOGÍSTICA FALABELLA",
     "TIO TOMATE": "TÍO TOMATE",
     "TRP": "APOYO TRP",
+    "TALLER": "TALLER TRP",
 }
 CANON = {
     "KAUFMANN": "KAUFMANN",
@@ -82,6 +92,7 @@ CANON = {
     "GRUPO ALCANSA": "Grupo Alcansa",
     "ANDES MOTOR": "Andes Motor",
     "APOYO TRP": "APOYO TRP",
+    "TALLER TRP": "TALLER TRP",
 }
 TIPO_AR = {
     "SALIDA CALENDARIZADA": "REGULAR", "SALIDA REALIZADA": "REGULAR",
@@ -109,6 +120,16 @@ def norm_base(s):
 def norm_empresa_key(s):
     n = norm_base(s)
     return EMP_ALIASES.get(n, n)
+
+def aplicar_override_apoyo_en_ruta(out):
+    """Si la ruta se llama 'Apoyo en Ruta' Y la empresa del consolidado también dice
+    'Apoyo en Ruta', se fuerza la comunidad AllRide a 'APOYO TRP' (caso puntual pedido
+    por Flo — distinto del alias general TRP->APOYO TRP, acá depende de ruta+empresa)."""
+    mask = (out["ruta_orig"].apply(norm_base) == "APOYO EN RUTA") & \
+           (out["empresa_orig"].apply(norm_base) == "APOYO EN RUTA")
+    out.loc[mask, "empresa_key"]   = "APOYO TRP"
+    out.loc[mask, "empresa_canon"] = "APOYO TRP"
+    return out
 
 def canon_empresa(s):
     key = norm_empresa_key(s)
@@ -284,6 +305,7 @@ def procesar_consolidado(df):
     out["empresa_orig"]  = df[col_empresa].astype(str).str.strip()
     out["empresa_key"]   = out["empresa_orig"].apply(norm_empresa_key)
     out["empresa_canon"] = out["empresa_orig"].apply(canon_empresa)
+    out = aplicar_override_apoyo_en_ruta(out)
     out["fecha"]         = pd.to_datetime(df[col_fecha], dayfirst=True, errors="coerce").dt.strftime("%d/%m/%Y")
     out["tipo_norm"]     = df[col_tipo].apply(lambda x: norm_base(str(x))) if col_tipo else "REGULAR"
     out["bodega"]        = df[col_bodega].apply(safe_str) if col_bodega else ""
@@ -346,6 +368,7 @@ def procesar_regiones(df):
     out["empresa_orig"]  = df[col_empresa].astype(str).str.strip()
     out["empresa_key"]   = out["empresa_orig"].apply(norm_empresa_key)
     out["empresa_canon"] = out["empresa_orig"].apply(canon_empresa)
+    out = aplicar_override_apoyo_en_ruta(out)
     out["es_spot"]       = out["ruta_orig"].apply(is_spot)
     out["bodega"]        = df[col_bodega].apply(safe_str) if col_bodega else ""
     out["tipo_mov"]      = df[col_tipo_mov].astype(str).str.strip().str.upper() if col_tipo_mov else ""
@@ -682,6 +705,17 @@ def gen_one_time_services_ots(crear_filas):
         archivos[f"one_time_services_{nombre}.xlsx"] = buf.getvalue()
     return archivos
 
+def evitar_colision_parada(parada_principal, parada_usuario, fallback):
+    """AllRide rechaza la fila si Parada Origen/Destino es igual a Parada Usuario.
+    Si coinciden, se reemplaza la parada usuario por la parada genérica de respaldo;
+    si esa misma parada de respaldo es la que choca (p.ej. sin archivo de paradas,
+    ambas cayeron al mismo genérico), se usa la otra parada genérica disponible."""
+    if parada_principal and parada_usuario and norm_base(parada_principal) == norm_base(parada_usuario):
+        alterno = PARADA_INGRESO if norm_base(fallback) == norm_base(PARADA_FALLBACK) else PARADA_FALLBACK
+        nuevo = fallback if norm_base(parada_principal) != norm_base(fallback) else alterno
+        return nuevo, True
+    return parada_usuario, False
+
 def gen_odd_spots(crear_filas, stops_df):
     por_emp = {}
     for row in crear_filas:
@@ -690,6 +724,7 @@ def gen_odd_spots(crear_filas, stops_df):
 
     stops_cache = {}
     archivos    = {}
+    colisiones  = 0
 
     for emp, rows in por_emp.items():
         emp_key = norm_empresa_key(emp)
@@ -718,6 +753,7 @@ def gen_odd_spots(crear_filas, stops_df):
                 parada_dest_raw = ultima
                 npd = None  # No se llena en Origen según nueva lógica
                 parada_usuario = parada_dest_raw if es_parada_valida(parada_dest_raw) and parada_dest_raw in emp_stops else PARADA_FALLBACK
+                parada_usuario, colision = evitar_colision_parada(npo, parada_usuario, PARADA_FALLBACK)
                 od = "Origen"
             else:
                 # Destino: parada_destino + parada_usuario (sin origen)
@@ -725,7 +761,11 @@ def gen_odd_spots(crear_filas, stops_df):
                 npd = bodega if bodega and bodega in emp_stops else PARADA_INGRESO
                 parada_usuario_raw = ultima
                 parada_usuario = parada_usuario_raw if es_parada_valida(parada_usuario_raw) else PARADA_INGRESO
+                parada_usuario, colision = evitar_colision_parada(npd, parada_usuario, PARADA_INGRESO)
                 od = "Destino"
+
+            if colision:
+                colisiones += 1
 
             ws.cell(i, 1, i-1).font = font
             ws.cell(i, 2, row["ruta_orig"]).font = font
@@ -745,7 +785,7 @@ def gen_odd_spots(crear_filas, stops_df):
         buf = BytesIO(); wb.save(buf)
         nombre = re.sub(r"[^\w\-]", "_", emp)[:40]
         archivos[f"ODD_SPOTS_{nombre}.xlsx"] = buf.getvalue()
-    return archivos
+    return archivos, colisiones
 
 def gen_cancelacion(cancelar_filas, tmpl_file_bytes):
     """Genera archivo solo con las filas a cancelar (no todas)."""
@@ -1058,7 +1098,10 @@ with tabs[5]:
                     "Fecha":r["fecha"],"Hora":r["hora_allride"],
                     "Ruta":r["ruta_orig"],"Tipo":r.get("tipo_mov","")
                 } for r in rows]))
-        arch = gen_odd_spots(crear_spot, stops_df)
+        arch, colisiones = gen_odd_spots(crear_spot, stops_df)
+        if colisiones:
+            st.warning(f"⚠️ {colisiones} fila(s) tenían la misma parada en Origen/Destino y en Parada usuario "
+                       "(AllRide lo rechaza) — se reemplazó automáticamente la parada usuario por la genérica. Revisar antes de subir.")
         if len(arch) == 1:
             name, data = list(arch.items())[0]
             st.download_button(f"⬇️ {name}", data, name, use_container_width=True)
@@ -1149,7 +1192,7 @@ with tabs[8]:
             todos["04_editar_spot/Edicion_horarios_SPOT.xlsx"] = gen_edicion_horarios(editar_spot, f_edit_spot_tmpl)
         for k,v in gen_one_time_services_ots(crear_reg).items():
             todos[f"05_crear_reg/{k}"] = v
-        for k,v in gen_odd_spots(crear_spot, stops_df).items():
+        for k,v in gen_odd_spots(crear_spot, stops_df)[0].items():
             todos[f"06_crear_spot/{k}"] = v
         todos["07_cancelar/Cancelacion_masiva.xlsx"] = gen_cancelacion(res["cancelar"], f_cancel_tmpl.read())
         zip_data = gen_zip(todos)
@@ -1158,4 +1201,4 @@ with tabs[8]:
         st.success(f"✅ {len(todos)} archivos en {len(set(k.split('/')[0] for k in todos))} carpetas.")
 
 st.divider()
-st.caption("AllRide Cuadratura v2.8 · Fix fecha OTS (numFmtId=14) · Descargas individuales")
+st.caption("AllRide Cuadratura v3.0 · Apoyo en Ruta & sin colisión de paradas ODD")
