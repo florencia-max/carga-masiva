@@ -1,5 +1,5 @@
 """
-AllRide – Cuadratura de viajes v2.4
+AllRide – Cuadratura de viajes v2.6
 Cambios:
 - Selección de filas a editar con checkbox + Seleccionar todo
 - Archivo consolidado de no-editados
@@ -11,6 +11,16 @@ Cambios:
 - Edición horarios: incluye Comunidades, Tipo, Estado, Fecha de servicio
 - Edición horarios: incluye ID de salida (del export AllRide o de la plantilla), respeta
   el formato/fuente original de la plantilla, y filtra viajes sin cambio real de hora
+- Homologación TRP -> APOYO TRP
+- Nuevo chequeo "Programación Regiones": verifica rutas creadas contra Routes_edition_template
+  (catálogo de rutas), distinguiendo "otra comunidad" de "falta crear"
+- norm_ruta: normaliza "NOMBRE - 01" vs "NOMBRE 1" sin fusionar números de ruta distintos
+- Edición horarios: columna "Tipo" ahora usa el código interno que AllRide espera
+  (scheduled_departure / route_service / odd) en vez de la etiqueta legible; "odd" para
+  SPOT fue indicado por Flo pero aún no está confirmado con una carga exitosa
+- Edición horarios: "Distancia de servicio" ahora sale en 0 en vez de vacío
+- Cuadratura SPOT: ya no se compara horario, solo existencia de la ruta por nombre
+  (si existe ese día, se considera OK; nunca se manda a "editar" por horario)
 """
 
 import streamlit as st
@@ -70,6 +80,16 @@ TIPO_AR = {
     "SALIDA CALENDARIZADA": "REGULAR", "SALIDA REALIZADA": "REGULAR",
     "SERVICIO REGULAR": "REGULAR", "SERVICIO ESPECIAL": "SPOT",
 }
+# Código interno que AllRide espera en el Excel de Edición de Horarios (columna "Tipo").
+# Confirmados con datos reales: route_service y scheduled_departure.
+# "odd" (Servicio Especial/SPOT) fue indicado por Flo pero AÚN NO CONFIRMADO con un archivo
+# que se haya subido con éxito a AllRide — recordarle validarlo la primera vez que lo use.
+# "Salida Realizada" no tiene código confirmado: se deja el valor original sin mapear.
+TIPO_INTERNO = {
+    "SALIDA CALENDARIZADA": "scheduled_departure",
+    "SERVICIO REGULAR": "route_service",
+    "SERVICIO ESPECIAL": "odd",
+}
 PARADA_FALLBACK = "Parada TRP"
 PARADA_INGRESO  = "Parada"
 
@@ -89,7 +109,12 @@ def canon_empresa(s):
 
 def norm_ruta(s):
     s = re.sub(r"^RDD\s*-\s*", "", str(s).strip(), flags=re.IGNORECASE)
-    return norm_base(s)
+    s = re.sub(r"\s+-\s+", " ", s)          # "VALPARAISO - 01" -> "VALPARAISO 01"
+    s = norm_base(s)
+    tokens = s.split(" ")
+    tokens = [str(int(t)) if t.isdigit() else t for t in tokens]  # "01" -> "1"
+    s = " ".join(tokens)
+    return re.sub(r"\s+", " ", s).strip()
 
 def is_spot(ruta):
     return "SPOT" in norm_base(str(ruta))
@@ -321,15 +346,30 @@ def procesar_regiones(df):
     out = out.drop_duplicates(subset=["ruta_norm","empresa_key"]).reset_index(drop=True)
     return out
 
-def chequear_rutas_regiones(regiones, ar, fecha_objetivo=None):
-    """Chequea solo EXISTENCIA de ruta+empresa en AllRide (sin considerar horario).
-    Si se entrega fecha_objetivo, restringe la comparación a esa fecha."""
-    ar_f = ar[ar["fecha"] == fecha_objetivo] if fecha_objetivo else ar
-    existentes = set(zip(ar_f["ruta_norm"], ar_f["empresa_key"]))
-    res = {"existe": [], "falta": []}
+def chequear_rutas_regiones(regiones, routes_df):
+    """Chequea que la ruta esté CREADA en AllRide (catálogo Routes_edition_template),
+    sin considerar horario ni servicios generados ese día. Misma lógica que analizar_rutas:
+    si la ruta existe pero no está habilitada para la comunidad, se marca aparte."""
+    routes_info = {}
+    for _, r in routes_df.iterrows():
+        n = norm_ruta(str(r.get("Nombre ruta","")))
+        comunidades = str(r.get("Comunidades (Nombre exacto, separados por comas)",""))
+        routes_info.setdefault(n, []).append(comunidades)
+
+    res = {"existe": [], "falta": [], "otra_comunidad": []}
     for _, r in regiones.iterrows():
-        k = (r["ruta_norm"], r["empresa_key"])
-        (res["existe"] if k in existentes else res["falta"]).append(r)
+        n = r["ruta_norm"]
+        empresa_key = r["empresa_key"]
+        if n not in routes_info:
+            res["falta"].append(r)
+            continue
+        matched = False
+        for comunidades in routes_info[n]:
+            comps = [norm_empresa_key(c.strip()) for c in re.split(r"[,;]", comunidades) if c.strip()]
+            if not comps or empresa_key in comps:
+                matched = True
+                break
+        (res["existe"] if matched else res["otra_comunidad"]).append(r)
     return res
 
 def cuadrar(cli, ar):
@@ -348,6 +388,15 @@ def cuadrar(cli, ar):
 
         if not candidatos:
             res["crear"].append(crow); continue
+
+        if crow["es_spot"]:
+            # SPOT: solo importa que exista la ruta ese día — el horario no se compara ni se edita
+            no_usados = [(i,r) for i,r in candidatos if i not in ar_usados]
+            if not no_usados:
+                res["crear"].append(crow); continue
+            idx_m, row_m = no_usados[0]
+            ar_usados.add(idx_m)
+            res["ok"].append(row_m); continue
 
         exactos = [(i,r) for i,r in candidatos if r["hora"] == hora_obj]
         if exactos:
@@ -537,6 +586,7 @@ def gen_edicion_horarios(editar_filas, tmpl_file=None):
         col_estado    = fc(["Estado"])
         col_fecha_svc = fc(["Fecha de servicio","Fecha estimada de inicio","Fecha de inicio","Fecha"])
         col_com       = fc(["Comunidades"])
+        col_distancia = fc(["Distancia de servicio"])
 
         # Guarda el formato (fuente) de cada columna, y arma un lookup de ID de salida
         # a partir de los datos originales de la plantilla, ANTES de borrar filas.
@@ -557,14 +607,16 @@ def gen_edicion_horarios(editar_filas, tmpl_file=None):
             ar = e["ar_row"]
             id_svc    = ar["id"]
             id_salida = safe_str(ar.get("id_salida","")) or id_salida_lookup.get(id_svc, "")
+            tipo_cod  = TIPO_INTERNO.get(norm_base(ar["tipo_orig"]), ar["tipo_orig"])
             if col_id:        ws.cell(i, col_id,    id_svc).font = col_fonts.get(col_id, font)
             if col_id_salida: ws.cell(i, col_id_salida, id_salida).font = col_fonts.get(col_id_salida, font)
             if col_hora:      ws.cell(i, col_hora,  e["hora_nueva"]).font = col_fonts.get(col_hora, font)
             if col_ruta:      ws.cell(i, col_ruta,  ar["ruta_orig"]).font = col_fonts.get(col_ruta, font)
-            if col_tipo:      ws.cell(i, col_tipo,  ar["tipo_orig"]).font = col_fonts.get(col_tipo, font)
+            if col_tipo:      ws.cell(i, col_tipo,  tipo_cod).font = col_fonts.get(col_tipo, font)
             if col_estado:    ws.cell(i, col_estado,ar["estado"]).font = col_fonts.get(col_estado, font)
             if col_fecha_svc: ws.cell(i, col_fecha_svc, ar["fecha"]).font = col_fonts.get(col_fecha_svc, font)
             if col_com:       ws.cell(i, col_com,   ar["empresa_orig"]).font = col_fonts.get(col_com, font)
+            if col_distancia: ws.cell(i, col_distancia, 0).font = col_fonts.get(col_distancia, font)
         buf = BytesIO(); wb.save(buf); return buf.getvalue()
 
     # Sin plantilla: tabla completa
@@ -572,10 +624,11 @@ def gen_edicion_horarios(editar_filas, tmpl_file=None):
         "ID de servicio": e["ar_row"]["id"],
         "ID de salida": safe_str(e["ar_row"].get("id_salida","")),
         "Comunidades": e["ar_row"]["empresa_orig"],
-        "Tipo": e["ar_row"]["tipo_orig"],
+        "Tipo": TIPO_INTERNO.get(norm_base(e["ar_row"]["tipo_orig"]), e["ar_row"]["tipo_orig"]),
         "Estado": e["ar_row"]["estado"],
         "Ruta": e["ar_row"]["ruta_orig"],
         "Fecha de servicio": e["ar_row"]["fecha"],
+        "Distancia de servicio": 0,
         "Hora actual": e["hora_actual"],
         "Hora nueva": e["hora_nueva"],
     } for e in editar_filas]
@@ -768,14 +821,12 @@ with st.spinner("Procesando..."):
     crear_spot  = [r for r in res["crear"]  if  r["es_spot"]]
 
     regiones_raw, hoja_regiones = leer_hoja_opcional(f_consolidado, ["Programación Regiones","PROGRAMACION REGIONES","Regiones"])
-    if regiones_raw is not None:
+    if regiones_raw is not None and f_routes_list:
         regiones = procesar_regiones(regiones_raw)
-        fecha_objetivo_regiones = cli["fecha"].mode().iloc[0] if len(cli) else None
-        res_regiones = chequear_rutas_regiones(regiones, ar, fecha_objetivo_regiones)
+        res_regiones = chequear_rutas_regiones(regiones, routes_df)
     else:
         regiones = None
         res_regiones = None
-        fecha_objetivo_regiones = None
 
 st.caption(f"📋 Hoja **{hoja_cli}** · {len(cli)} viajes cliente · {len(ar)} viajes AllRide")
 
@@ -908,6 +959,7 @@ with tabs[2]:
 # ─── TAB 4 — EDITAR SPOT ────────────────────────────────────────────────────
 with tabs[3]:
     st.subheader("4️⃣ Edición de horarios — SPOT")
+    st.caption("Los SPOT se cuadran solo por nombre de ruta — el horario ya no se compara ni se edita.")
     if not editar_spot:
         st.success("✅ No hay viajes SPOT que editar.")
     else:
@@ -1024,17 +1076,25 @@ with tabs[6]:
 # ─── TAB 8 — REGIONES ───────────────────────────────────────────────────────
 with tabs[7]:
     st.subheader("🗺️ Chequeo de rutas — Programación Regiones")
-    st.caption("Solo verifica que la ruta exista creada en AllRide ese día — no revisa horario.")
+    st.caption("Verifica que la ruta esté CREADA en AllRide (catálogo de rutas) para la comunidad correcta — no revisa horario ni servicios generados.")
     if regiones_raw is None:
         st.info("No se encontró una pestaña 'Programación Regiones' en el consolidado del cliente.")
+    elif not f_routes_list:
+        st.warning("⚠️ Sube el archivo de rutas existentes (Routes_edition_template) para poder hacer este chequeo.")
     elif regiones is None or len(regiones) == 0:
         st.warning("⚠️ Se encontró la pestaña pero no se pudieron leer columnas de ruta/empresa.")
     else:
-        st.caption(f"📋 Hoja **{hoja_regiones}** · {len(regiones)} rutas únicas (ruta+empresa) · "
-                   f"comparando contra AllRide fecha **{fecha_objetivo_regiones or 'todas'}**")
-        c1, c2 = st.columns(2)
-        c1.metric("✅ Existen en AllRide", len(res_regiones["existe"]))
+        st.caption(f"📋 Hoja **{hoja_regiones}** · {len(regiones)} rutas únicas (ruta+empresa)")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("✅ Creadas en AllRide", len(res_regiones["existe"]))
         c2.metric("➕ Faltan por crear", len(res_regiones["falta"]))
+        c3.metric("⚠️ Otra comunidad", len(res_regiones["otra_comunidad"]))
+
+        if res_regiones["otra_comunidad"]:
+            st.error(f"**{len(res_regiones['otra_comunidad'])} rutas** existen en AllRide pero NO están habilitadas para esa comunidad:")
+            st.dataframe(pd.DataFrame([{
+                "Empresa consolidado": r["empresa_canon"], "Ruta": r["ruta_orig"],
+            } for r in res_regiones["otra_comunidad"]]), use_container_width=True)
 
         if res_regiones["falta"]:
             st.warning(f"**{len(res_regiones['falta'])} rutas** de Programación Regiones no están creadas en AllRide:")
@@ -1049,7 +1109,7 @@ with tabs[7]:
             st.download_button("⬇️ Rutas regiones faltantes (.xlsx)", buf.getvalue(),
                 "Rutas_regiones_faltantes.xlsx", use_container_width=True)
         else:
-            st.success("✅ Todas las rutas de Programación Regiones existen en AllRide.")
+            st.success("✅ Todas las rutas de Programación Regiones están creadas en AllRide.")
 
         with st.expander(f"Ver rutas que sí existen ({len(res_regiones['existe'])})"):
             st.dataframe(pd.DataFrame([{
@@ -1085,4 +1145,4 @@ with tabs[8]:
         st.success(f"✅ {len(todos)} archivos en {len(set(k.split('/')[0] for k in todos))} carpetas.")
 
 st.divider()
-st.caption("AllRide Cuadratura v2.4 · ID de salida · Formato de plantilla · Solo cambios reales")
+st.caption("AllRide Cuadratura v2.6 · Tipo interno AllRide · SPOT solo por nombre · Distancia=0")
