@@ -212,6 +212,24 @@ def leer_consolidado(f):
     if not hoja: hoja = xl.sheet_names[0]
     return pd.read_excel(f, sheet_name=hoja), hoja
 
+def leer_hoja_opcional(f, candidates):
+    """Busca una hoja específica (p.ej. 'Programación Regiones') dentro del mismo
+    archivo del cliente. Devuelve (df, nombre_hoja) o (None, None) si no existe."""
+    try:
+        f.seek(0)
+        xl = pd.ExcelFile(f)
+        cand_norm = [norm_base(c) for c in candidates]
+        hoja = None
+        for h in xl.sheet_names:
+            if norm_base(h) in cand_norm:
+                hoja = h; break
+        if not hoja:
+            return None, None
+        f.seek(0)
+        return pd.read_excel(f, sheet_name=hoja), hoja
+    except Exception:
+        return None, None
+
 def procesar_consolidado(df):
     cols = list(df.columns)
     col_ruta      = detectar_col(cols, ["NUEVO NOMBRE RUTA FINAL","NOMBRE RUTA FINAL","NOMBRE RUTA"])
@@ -278,6 +296,41 @@ def procesar_allride(df):
     out["hora"]          = fecha_raw.apply(parse_hora_ar)
     out["es_spot"]       = out["ruta_norm"].apply(is_spot)
     return out.reset_index(drop=True)
+
+def procesar_regiones(df):
+    """Procesa la pestaña 'Programación Regiones': solo ruta + empresa,
+    sin horario (esa pestaña no tiene una fecha real por servicio)."""
+    cols = list(df.columns)
+    col_ruta     = detectar_col(cols, ["NUEVO NOMBRE RUTA FINAL","NOMBRE RUTA FINAL","NOMBRE RUTA"])
+    col_empresa  = detectar_col(cols, ["EMPRESA"])
+    col_bodega   = detectar_col(cols, ["BODEGA"])
+    col_tipo_mov = detectar_col(cols, ["TIPO ","TIPO"])
+    if not col_ruta or not col_empresa:
+        return pd.DataFrame(columns=["ruta_orig","ruta_norm","empresa_orig","empresa_key","empresa_canon","es_spot","bodega","tipo_mov"])
+
+    out = pd.DataFrame()
+    out["ruta_orig"]     = df[col_ruta].astype(str).str.strip()
+    out["ruta_norm"]     = out["ruta_orig"].apply(norm_ruta)
+    out["empresa_orig"]  = df[col_empresa].astype(str).str.strip()
+    out["empresa_key"]   = out["empresa_orig"].apply(norm_empresa_key)
+    out["empresa_canon"] = out["empresa_orig"].apply(canon_empresa)
+    out["es_spot"]       = out["ruta_orig"].apply(is_spot)
+    out["bodega"]        = df[col_bodega].apply(safe_str) if col_bodega else ""
+    out["tipo_mov"]      = df[col_tipo_mov].astype(str).str.strip().str.upper() if col_tipo_mov else ""
+    out = out[out["ruta_orig"].notna() & ~out["ruta_orig"].isin(["","NAN","nan","None"])]
+    out = out.drop_duplicates(subset=["ruta_norm","empresa_key"]).reset_index(drop=True)
+    return out
+
+def chequear_rutas_regiones(regiones, ar, fecha_objetivo=None):
+    """Chequea solo EXISTENCIA de ruta+empresa en AllRide (sin considerar horario).
+    Si se entrega fecha_objetivo, restringe la comparación a esa fecha."""
+    ar_f = ar[ar["fecha"] == fecha_objetivo] if fecha_objetivo else ar
+    existentes = set(zip(ar_f["ruta_norm"], ar_f["empresa_key"]))
+    res = {"existe": [], "falta": []}
+    for _, r in regiones.iterrows():
+        k = (r["ruta_norm"], r["empresa_key"])
+        (res["existe"] if k in existentes else res["falta"]).append(r)
+    return res
 
 def cuadrar(cli, ar):
     ar_grupos = {}
@@ -714,6 +767,16 @@ with st.spinner("Procesando..."):
     crear_reg   = [r for r in res["crear"]  if not r["es_spot"]]
     crear_spot  = [r for r in res["crear"]  if  r["es_spot"]]
 
+    regiones_raw, hoja_regiones = leer_hoja_opcional(f_consolidado, ["Programación Regiones","PROGRAMACION REGIONES","Regiones"])
+    if regiones_raw is not None:
+        regiones = procesar_regiones(regiones_raw)
+        fecha_objetivo_regiones = cli["fecha"].mode().iloc[0] if len(cli) else None
+        res_regiones = chequear_rutas_regiones(regiones, ar, fecha_objetivo_regiones)
+    else:
+        regiones = None
+        res_regiones = None
+        fecha_objetivo_regiones = None
+
 st.caption(f"📋 Hoja **{hoja_cli}** · {len(cli)} viajes cliente · {len(ar)} viajes AllRide")
 
 st.divider()
@@ -729,7 +792,7 @@ c[6].metric("📋 Total cliente",len(cli))
 tabs = st.tabs([
     "1️⃣ Paradas","2️⃣ Rutas nuevas","3️⃣ Editar regulares",
     "4️⃣ Editar SPOT","5️⃣ Crear regulares","6️⃣ Crear SPOT",
-    "7️⃣ Cancelación","📦 Todo en ZIP",
+    "7️⃣ Cancelación","🗺️ Regiones","📦 Todo en ZIP",
 ])
 
 # ─── TAB 1 ───────────────────────────────────────────────────────────────────
@@ -773,6 +836,21 @@ with tabs[1]:
         else:
             if not alertas_comunidad:
                 st.success("✅ Todas las rutas ya existen en AllRide.")
+
+    if res_regiones and res_regiones["falta"]:
+        st.divider()
+        st.subheader("🗺️ Rutas faltantes — Programación Regiones")
+        rutas_nuevas_regiones = [{
+            "Nombre ruta": r["ruta_orig"],
+            "Empresa": r["empresa_canon"],
+            "Tipo mov": r.get("tipo_mov",""),
+            "Bodega": r.get("bodega",""),
+        } for r in res_regiones["falta"]]
+        st.error(f"🔴 **{len(rutas_nuevas_regiones)} rutas** de Programación Regiones no existen en AllRide:")
+        st.dataframe(pd.DataFrame(rutas_nuevas_regiones), use_container_width=True)
+        st.download_button("⬇️ Descargar rutas de Regiones a crear",
+            gen_routes_creation(rutas_nuevas_regiones),
+            "rutas_regiones_a_crear.xlsx", use_container_width=True, key="dl_rutas_regiones")
 
 # ─── TAB 3 — EDITAR REGULARES ────────────────────────────────────────────────
 with tabs[2]:
@@ -943,8 +1021,43 @@ with tabs[6]:
             gen_cancelacion(res["cancelar"], f_cancel_tmpl.read()),
             "Cancelacion_masiva.xlsx", use_container_width=True)
 
-# ─── TAB 8 ───────────────────────────────────────────────────────────────────
+# ─── TAB 8 — REGIONES ───────────────────────────────────────────────────────
 with tabs[7]:
+    st.subheader("🗺️ Chequeo de rutas — Programación Regiones")
+    st.caption("Solo verifica que la ruta exista creada en AllRide ese día — no revisa horario.")
+    if regiones_raw is None:
+        st.info("No se encontró una pestaña 'Programación Regiones' en el consolidado del cliente.")
+    elif regiones is None or len(regiones) == 0:
+        st.warning("⚠️ Se encontró la pestaña pero no se pudieron leer columnas de ruta/empresa.")
+    else:
+        st.caption(f"📋 Hoja **{hoja_regiones}** · {len(regiones)} rutas únicas (ruta+empresa) · "
+                   f"comparando contra AllRide fecha **{fecha_objetivo_regiones or 'todas'}**")
+        c1, c2 = st.columns(2)
+        c1.metric("✅ Existen en AllRide", len(res_regiones["existe"]))
+        c2.metric("➕ Faltan por crear", len(res_regiones["falta"]))
+
+        if res_regiones["falta"]:
+            st.warning(f"**{len(res_regiones['falta'])} rutas** de Programación Regiones no están creadas en AllRide:")
+            df_falta = pd.DataFrame([{
+                "Empresa": r["empresa_canon"],
+                "Ruta": r["ruta_orig"],
+                "SPOT": "Sí" if r["es_spot"] else "No",
+            } for r in res_regiones["falta"]])
+            st.dataframe(df_falta, use_container_width=True)
+            buf = BytesIO()
+            df_falta.to_excel(buf, index=False)
+            st.download_button("⬇️ Rutas regiones faltantes (.xlsx)", buf.getvalue(),
+                "Rutas_regiones_faltantes.xlsx", use_container_width=True)
+        else:
+            st.success("✅ Todas las rutas de Programación Regiones existen en AllRide.")
+
+        with st.expander(f"Ver rutas que sí existen ({len(res_regiones['existe'])})"):
+            st.dataframe(pd.DataFrame([{
+                "Empresa": r["empresa_canon"], "Ruta": r["ruta_orig"],
+            } for r in res_regiones["existe"]]), use_container_width=True)
+
+# ─── TAB 9 ───────────────────────────────────────────────────────────────────
+with tabs[8]:
     st.subheader("📦 Paquete completo")
     st.info("Genera un ZIP con todos los archivos en el orden correcto.")
     if st.button("🚀 Generar paquete completo", type="primary", use_container_width=True):
