@@ -1,5 +1,5 @@
 """
-AllRide – Cuadratura de viajes v2.6
+AllRide – Cuadratura de viajes v2.8
 Cambios:
 - Selección de filas a editar con checkbox + Seleccionar todo
 - Archivo consolidado de no-editados
@@ -21,6 +21,13 @@ Cambios:
 - Edición horarios: "Distancia de servicio" ahora sale en 0 en vez de vacío
 - Cuadratura SPOT: ya no se compara horario, solo existencia de la ruta por nombre
   (si existe ese día, se considera OK; nunca se manda a "editar" por horario)
+- Cancelación: los servicios de AllRide con estado "Cancelado" ya no se cuentan ni
+  aparecen en la lista/archivo de cancelar (ya están cancelados, no hay nada que hacer)
+- Fix crítico OTS (crear regulares): la fecha se guardaba con un numFmtId personalizado
+  en vez del numFmtId=14 real que exige AllRide, por eso creaba los viajes con año 2020.
+  Ahora usa 'mm-dd-yy' (el string que openpyxl mapea al numFmtId=14 real, sin custom)
+- Crear regulares y Crear SPOT: cuando hay varias comunidades, ahora se descarga un
+  archivo por comunidad (botones individuales) en vez de un único .zip
 """
 
 import streamlit as st
@@ -418,7 +425,7 @@ def cuadrar(cli, ar):
 
     for k, grupo in ar_grupos.items():
         for idx, row in grupo:
-            if idx not in ar_usados:
+            if idx not in ar_usados and norm_base(row["estado"]) != "CANCELADO":
                 res["cancelar"].append(row)
 
     return res
@@ -638,8 +645,12 @@ def gen_edicion_horarios(editar_filas, tmpl_file=None):
 
 def gen_one_time_services_ots(crear_filas):
     """
-    Genera OTS con fecha como serial Excel + numFmtId=14 (igual que HTML).
-    Usa openpyxl con number_format 'DD-MM-YYYY' que fuerza el tipo numérico.
+    Genera OTS con fecha como serial Excel + numFmtId=14 real (igual que HTML).
+    IMPORTANTE: el string de formato debe ser exactamente 'mm-dd-yy' (la entrada
+    incorporada de openpyxl para numFmtId=14). Cualquier otro string ("DD-MM-YYYY",
+    etc.) hace que openpyxl cree un numFmtId personalizado en vez de reutilizar el 14,
+    y AllRide no reconoce la celda como fecha con un numFmtId distinto de 14 — eso
+    causaba que creara los viajes con año 2020 en vez de la fecha real.
     """
     por_emp = {}
     for row in crear_filas:
@@ -656,11 +667,11 @@ def gen_one_time_services_ots(crear_filas):
         for i, row in enumerate(rows, 2):
             # Ruta
             ws.cell(i, 1, row["ruta_orig"]).font = font
-            # Fecha como serial Excel
+            # Fecha como serial Excel con numFmtId=14 real
             serial = fecha_a_serial_excel(row["fecha"])
             cell_fecha = ws.cell(i, 2, serial)
             cell_fecha.font = font
-            cell_fecha.number_format = "DD-MM-YYYY"  # openpyxl usa numFmtId compatible
+            cell_fecha.number_format = "mm-dd-yy"  # <- fuerza numFmtId=14 real de openpyxl
             # Hora como texto
             ws.cell(i, 3, row["hora_allride"]).font = font
             # Cantidad vehículos
@@ -1027,9 +1038,10 @@ with tabs[4]:
             name, data = list(arch.items())[0]
             st.download_button(f"⬇️ {name}", data, name, use_container_width=True)
         else:
-            st.download_button(f"⬇️ Descargar todos ({len(arch)} archivos .zip)",
-                gen_zip(arch), "one_time_services.zip",
-                mime="application/zip", use_container_width=True)
+            st.caption(f"{len(arch)} archivos — uno por comunidad/empresa:")
+            for name, data in sorted(arch.items()):
+                st.download_button(f"⬇️ {name}", data, name,
+                    use_container_width=True, key=f"dl_ots_{name}")
 
 # ─── TAB 6 ───────────────────────────────────────────────────────────────────
 with tabs[5]:
@@ -1051,9 +1063,10 @@ with tabs[5]:
             name, data = list(arch.items())[0]
             st.download_button(f"⬇️ {name}", data, name, use_container_width=True)
         else:
-            st.download_button(f"⬇️ Descargar todos ({len(arch)} archivos .zip)",
-                gen_zip(arch), "ODD_SPOTS.zip",
-                mime="application/zip", use_container_width=True)
+            st.caption(f"{len(arch)} archivos — uno por comunidad/empresa:")
+            for name, data in sorted(arch.items()):
+                st.download_button(f"⬇️ {name}", data, name,
+                    use_container_width=True, key=f"dl_odd_{name}")
         if not f_stops_list:
             st.caption("⚠️ Sin archivo de paradas, se usarán paradas genéricas.")
 
@@ -1145,4 +1158,4 @@ with tabs[8]:
         st.success(f"✅ {len(todos)} archivos en {len(set(k.split('/')[0] for k in todos))} carpetas.")
 
 st.divider()
-st.caption("AllRide Cuadratura v2.6 · Tipo interno AllRide · SPOT solo por nombre · Distancia=0")
+st.caption("AllRide Cuadratura v2.8 · Fix fecha OTS (numFmtId=14) · Descargas individuales")
