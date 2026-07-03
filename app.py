@@ -1,5 +1,5 @@
 """
-AllRide – Cuadratura de viajes v2.3
+AllRide – Cuadratura de viajes v2.4
 Cambios:
 - Selección de filas a editar con checkbox + Seleccionar todo
 - Archivo consolidado de no-editados
@@ -9,6 +9,8 @@ Cambios:
 - ODD Spots: Origen solo tiene npo+parada_usuario, Destino solo npd+parada_usuario
 - Cancelación: solo filas a cancelar (no todas)
 - Edición horarios: incluye Comunidades, Tipo, Estado, Fecha de servicio
+- Edición horarios: incluye ID de salida (del export AllRide o de la plantilla), respeta
+  el formato/fuente original de la plantilla, y filtra viajes sin cambio real de hora
 """
 
 import streamlit as st
@@ -17,6 +19,7 @@ import re
 import zipfile
 import base64
 import struct
+from copy import copy
 from io import BytesIO
 from datetime import timedelta, datetime, date
 import openpyxl
@@ -44,6 +47,7 @@ EMP_ALIASES = {
     "FALABELLA - SERENA": "FALABELLA - LA SERENA",
     "TRADIS LOGISTICA FALABELLA": "TRADIS LOGÍSTICA FALABELLA",
     "TIO TOMATE": "TÍO TOMATE",
+    "TRP": "APOYO TRP",
 }
 CANON = {
     "KAUFMANN": "KAUFMANN",
@@ -60,6 +64,7 @@ CANON = {
     "SODIMAC - CORONEL": "Sodimac - Coronel",
     "GRUPO ALCANSA": "Grupo Alcansa",
     "ANDES MOTOR": "Andes Motor",
+    "APOYO TRP": "APOYO TRP",
 }
 TIPO_AR = {
     "SALIDA CALENDARIZADA": "REGULAR", "SALIDA REALIZADA": "REGULAR",
@@ -254,11 +259,13 @@ def procesar_allride(df):
     col_empresa   = detectar_col(cols, ["Comunidades"])
     col_tipo      = detectar_col(cols, ["Tipo"])
     col_id        = detectar_col(cols, ["ID de servicio","Servicio","ID"])
+    col_id_salida = detectar_col(cols, ["ID de salida"])
     col_estado    = detectar_col(cols, ["Estado"])
 
     fecha_raw = df[col_fecha_raw] if col_fecha_raw else pd.Series([""] * len(df))
     out = pd.DataFrame()
     out["id"]            = df[col_id].astype(str).str.strip() if col_id else ""
+    out["id_salida"]     = df[col_id_salida].apply(safe_str) if col_id_salida else ""
     out["ruta_orig"]     = df[col_ruta].astype(str).str.strip() if col_ruta else ""
     out["ruta_norm"]     = out["ruta_orig"].apply(norm_ruta)
     out["empresa_orig"]  = df[col_empresa].astype(str).str.strip() if col_empresa else ""
@@ -450,8 +457,15 @@ def gen_routes_creation(rutas):
     buf = BytesIO(); wb.save(buf); return buf.getvalue()
 
 def gen_edicion_horarios(editar_filas, tmpl_file=None):
-    """Genera archivo de edición con todas las columnas requeridas."""
+    """Genera archivo de edición con todas las columnas requeridas.
+    - Incluye ID de salida cuando existe (desde el export AllRide o desde la plantilla).
+    - Respeta el formato (fuente) que ya trae la plantilla.
+    - Solo incluye viajes cuya hora realmente cambia.
+    """
     font = Font(name="Calibri", size=11)
+
+    # Filtro defensivo: solo viajes que de verdad requieren edición de horario
+    editar_filas = [e for e in editar_filas if str(e.get("hora_actual","")).strip() != str(e.get("hora_nueva","")).strip()]
 
     if tmpl_file:
         wb = openpyxl.load_workbook(BytesIO(tmpl_file.read()))
@@ -462,28 +476,48 @@ def gen_edicion_horarios(editar_filas, tmpl_file=None):
                 for i,h in enumerate(header):
                     if h and norm_base(str(h)) == norm_base(n): return i+1
             return None
-        col_id    = fc(["ID de servicio","ID"])
-        col_hora  = fc(["Hora del servicio","Hora de inicio","Hora"])
-        col_ruta  = fc(["Ruta","Nombre ruta"])
-        col_tipo  = fc(["Tipo"])
-        col_estado= fc(["Estado"])
+        col_id        = fc(["ID de servicio","ID"])
+        col_id_salida = fc(["ID de salida"])
+        col_hora      = fc(["Hora del servicio","Hora de inicio","Hora"])
+        col_ruta      = fc(["Ruta","Nombre ruta"])
+        col_tipo      = fc(["Tipo"])
+        col_estado    = fc(["Estado"])
         col_fecha_svc = fc(["Fecha de servicio","Fecha estimada de inicio","Fecha de inicio","Fecha"])
-        col_com   = fc(["Comunidades"])
+        col_com       = fc(["Comunidades"])
+
+        # Guarda el formato (fuente) de cada columna, y arma un lookup de ID de salida
+        # a partir de los datos originales de la plantilla, ANTES de borrar filas.
+        col_fonts = {}
+        id_salida_lookup = {}
+        for c in range(1, ws.max_column+1):
+            sample = ws.cell(2, c)
+            col_fonts[c] = copy(sample.font) if sample.font else font
+        if col_id and col_id_salida:
+            for r in range(2, ws.max_row+1):
+                sid = safe_str(ws.cell(r, col_id).value)
+                sal = safe_str(ws.cell(r, col_id_salida).value)
+                if sid and sal:
+                    id_salida_lookup[sid] = sal
+
         ws.delete_rows(2, ws.max_row)
         for i, e in enumerate(editar_filas, 2):
             ar = e["ar_row"]
-            if col_id:        ws.cell(i, col_id,    ar["id"]).font = font
-            if col_hora:      ws.cell(i, col_hora,  e["hora_nueva"]).font = font
-            if col_ruta:      ws.cell(i, col_ruta,  ar["ruta_orig"]).font = font
-            if col_tipo:      ws.cell(i, col_tipo,  ar["tipo_orig"]).font = font
-            if col_estado:    ws.cell(i, col_estado,ar["estado"]).font = font
-            if col_fecha_svc: ws.cell(i, col_fecha_svc, ar["fecha"]).font = font
-            if col_com:       ws.cell(i, col_com,   ar["empresa_orig"]).font = font
+            id_svc    = ar["id"]
+            id_salida = safe_str(ar.get("id_salida","")) or id_salida_lookup.get(id_svc, "")
+            if col_id:        ws.cell(i, col_id,    id_svc).font = col_fonts.get(col_id, font)
+            if col_id_salida: ws.cell(i, col_id_salida, id_salida).font = col_fonts.get(col_id_salida, font)
+            if col_hora:      ws.cell(i, col_hora,  e["hora_nueva"]).font = col_fonts.get(col_hora, font)
+            if col_ruta:      ws.cell(i, col_ruta,  ar["ruta_orig"]).font = col_fonts.get(col_ruta, font)
+            if col_tipo:      ws.cell(i, col_tipo,  ar["tipo_orig"]).font = col_fonts.get(col_tipo, font)
+            if col_estado:    ws.cell(i, col_estado,ar["estado"]).font = col_fonts.get(col_estado, font)
+            if col_fecha_svc: ws.cell(i, col_fecha_svc, ar["fecha"]).font = col_fonts.get(col_fecha_svc, font)
+            if col_com:       ws.cell(i, col_com,   ar["empresa_orig"]).font = col_fonts.get(col_com, font)
         buf = BytesIO(); wb.save(buf); return buf.getvalue()
 
     # Sin plantilla: tabla completa
     rows = [{
         "ID de servicio": e["ar_row"]["id"],
+        "ID de salida": safe_str(e["ar_row"].get("id_salida","")),
         "Comunidades": e["ar_row"]["empresa_orig"],
         "Tipo": e["ar_row"]["tipo_orig"],
         "Estado": e["ar_row"]["estado"],
@@ -938,4 +972,4 @@ with tabs[7]:
         st.success(f"✅ {len(todos)} archivos en {len(set(k.split('/')[0] for k in todos))} carpetas.")
 
 st.divider()
-st.caption("AllRide Cuadratura v2.3 · Serial Excel · Selección edición · Alerta comunidad · Solo cancelados")
+st.caption("AllRide Cuadratura v2.4 · ID de salida · Formato de plantilla · Solo cambios reales")
